@@ -15,6 +15,9 @@ import android.os.Handler
 import android.os.Looper
 import android.provider.MediaStore
 import android.util.Log
+import android.widget.EditText
+import android.widget.LinearLayout
+import android.widget.TextView
 import android.widget.Toast
 import de.robv.android.xposed.IXposedHookLoadPackage
 import de.robv.android.xposed.XC_MethodHook
@@ -39,9 +42,9 @@ class HookEntry : IXposedHookLoadPackage {
     companion object {
         private const val TAG = "ImageToolboxImgBed"
         private const val TARGET_PKG = "ru.tech.imageresizershrinker"
-        private const val BASE_URL = "https://imgbed1026.pages.dev"
-        // 若后台开启了上传认证密码，改为 "$BASE_URL/upload?authCode=你的密码"
-        private const val UPLOAD_URL = "$BASE_URL/upload"
+        private const val PREFS_NAME = "imgbed_hook_prefs"
+        private const val KEY_BASE_URL = "base_url"
+        private const val KEY_AUTH_CODE = "auth_code"
 
         private val executor = Executors.newSingleThreadExecutor()
         private val handledUris = Collections.synchronizedSet(HashSet<String>())
@@ -52,6 +55,22 @@ class HookEntry : IXposedHookLoadPackage {
         fun log(msg: String) {
             XposedBridge.log("[$TAG] $msg")
             Log.d(TAG, msg)
+        }
+
+        fun getConfig(context: Context): Pair<String, String> {
+            val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            val baseUrl = prefs.getString(KEY_BASE_URL, "")?.trim().orEmpty()
+            val authCode = prefs.getString(KEY_AUTH_CODE, "")?.trim().orEmpty()
+            return Pair(baseUrl, authCode)
+        }
+
+        fun saveConfig(context: Context, baseUrl: String, authCode: String) {
+            val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            prefs.edit()
+                .putString(KEY_BASE_URL, baseUrl)
+                .putString(KEY_AUTH_CODE, authCode)
+                .apply()
+            log("Saved config: baseUrl=$baseUrl, authCode=${if (authCode.isNotEmpty()) "***" else "(empty)"}")
         }
     }
 
@@ -121,14 +140,13 @@ class HookEntry : IXposedHookLoadPackage {
                     val rawOs = param.result as? OutputStream ?: return
                     val uriStr = uri.toString()
 
-                    // 仅关注媒体/文档保存流，排除无意义的临时缓存流
+                    // 仅关注媒体/文档保存流，排除临时缓存流
                     if (uriStr.startsWith("content://media/") ||
                         uriStr.contains("document") ||
                         uriStr.contains("storage")
                     ) {
                         log("openOutputStream intercepted for: $uriStr")
                         val resolver = param.thisObject as ContentResolver
-                        // 包装 OutputStream，在 close 完毕后触发保存完成弹窗
                         param.result = object : FilterOutputStream(rawOs) {
                             override fun close() {
                                 try {
@@ -167,18 +185,15 @@ class HookEntry : IXposedHookLoadPackage {
 
     private fun onImageSaveCompleted(resolver: ContentResolver, uri: Uri) {
         val uriStr = uri.toString()
-        // 去重防止同一张图在 update 和 close 中重复触发
         if (!handledUris.add(uriStr)) {
             log("URI already handled, skip: $uriStr")
             return
         }
 
-        // 短暂延迟 100ms 确保媒体库索引与文件系统完全落盘
         Handler(Looper.getMainLooper()).postDelayed({
             showChoiceDialog(resolver, uri)
         }, 100)
 
-        // 5秒后允许同一 URI 再次触发（方便覆盖保存场景）
         executor.execute {
             try {
                 Thread.sleep(5000)
@@ -187,10 +202,74 @@ class HookEntry : IXposedHookLoadPackage {
         }
     }
 
+    private fun showConfigDialog(activity: Activity, onSaved: (() -> Unit)? = null) {
+        val (currentBaseUrl, currentAuthCode) = getConfig(activity)
+
+        val container = LinearLayout(activity).apply {
+            orientation = LinearLayout.VERTICAL
+            val dp16 = (16 * activity.resources.displayMetrics.density).toInt()
+            val dp8 = (8 * activity.resources.displayMetrics.density).toInt()
+            setPadding(dp16, dp8, dp16, dp8)
+        }
+
+        val tvUrl = TextView(activity).apply {
+            text = "图床域名 / 基础 URL："
+            textSize = 14f
+        }
+        val etUrl = EditText(activity).apply {
+            hint = "例如: https://your-imgbed.pages.dev"
+            setText(currentBaseUrl)
+            setSingleLine()
+        }
+
+        val tvAuth = TextView(activity).apply {
+            text = "上传认证密码 AuthCode (无密码请留空)："
+            textSize = 14f
+            val dp12 = (12 * activity.resources.displayMetrics.density).toInt()
+            setPadding(0, dp12, 0, 0)
+        }
+        val etAuth = EditText(activity).apply {
+            hint = "选填"
+            setText(currentAuthCode)
+            setSingleLine()
+        }
+
+        container.addView(tvUrl)
+        container.addView(etUrl)
+        container.addView(tvAuth)
+        container.addView(etAuth)
+
+        AlertDialog.Builder(activity, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+            .setTitle("⚙️ 图床参数配置")
+            .setView(container)
+            .setPositiveButton("保存") { dialog, _ ->
+                var url = etUrl.text.toString().trim()
+                val auth = etAuth.text.toString().trim()
+
+                if (url.isNotEmpty()) {
+                    if (!url.startsWith("http://") && !url.startsWith("https://")) {
+                        url = "https://$url"
+                    }
+                    while (url.endsWith("/")) {
+                        url = url.substring(0, url.length - 1)
+                    }
+                }
+
+                saveConfig(activity, url, auth)
+                Toast.makeText(activity, "图床配置已保存！", Toast.LENGTH_SHORT).show()
+                dialog.dismiss()
+                onSaved?.invoke()
+            }
+            .setNegativeButton("取消") { dialog, _ ->
+                dialog.dismiss()
+            }
+            .show()
+    }
+
     private fun showChoiceDialog(resolver: ContentResolver, uri: Uri) {
         val activity = currentActivityRef?.get()
         if (activity == null || activity.isFinishing || activity.isDestroyed) {
-            log("Cannot show dialog: current Activity is null or finishing! Falling back to Toast notification.")
+            log("Cannot show dialog: current Activity is null or finishing!")
             val ctx = appContext ?: AndroidAppHelper.currentApplication()
             ctx?.let {
                 Handler(Looper.getMainLooper()).post {
@@ -200,29 +279,51 @@ class HookEntry : IXposedHookLoadPackage {
             return
         }
 
+        val (baseUrl, authCode) = getConfig(activity)
+        val message = if (baseUrl.isNotEmpty()) {
+            "当前图床: $baseUrl\n请选择后续操作："
+        } else {
+            "当前尚未配置图床！\n请点击【⚙️ 配置】填写你的私有图床域名。"
+        }
+
         log("Showing choice dialog on Activity: ${activity.javaClass.simpleName}")
         AlertDialog.Builder(activity, android.R.style.Theme_DeviceDefault_Dialog_Alert)
             .setTitle("图片已保存")
-            .setMessage("请选择后续操作：")
+            .setMessage(message)
             .setNegativeButton("正常保存") { dialog, _ ->
                 log("User selected: 正常保存")
                 dialog.dismiss()
             }
             .setPositiveButton("保存并上传图床") { dialog, _ ->
+                if (baseUrl.isEmpty()) {
+                    dialog.dismiss()
+                    Toast.makeText(activity, "请先配置图床域名！", Toast.LENGTH_SHORT).show()
+                    showConfigDialog(activity) {
+                        showChoiceDialog(resolver, uri)
+                    }
+                    return@setPositiveButton
+                }
+
                 log("User selected: 保存并上传图床")
                 dialog.dismiss()
                 Toast.makeText(activity, "正在上传图床...", Toast.LENGTH_SHORT).show()
                 executor.execute {
-                    uploadAndCopy(resolver, uri)
+                    uploadAndCopy(resolver, uri, baseUrl, authCode)
+                }
+            }
+            .setNeutralButton("⚙️ 配置") { dialog, _ ->
+                dialog.dismiss()
+                showConfigDialog(activity) {
+                    showChoiceDialog(resolver, uri)
                 }
             }
             .setCancelable(true)
             .show()
     }
 
-    private fun uploadAndCopy(resolver: ContentResolver, uri: Uri) {
+    private fun uploadAndCopy(resolver: ContentResolver, uri: Uri, baseUrl: String, authCode: String) {
         try {
-            log("Starting upload for URI: $uri")
+            log("Starting upload for URI: $uri to $baseUrl")
             val bytes = resolver.openInputStream(uri)?.use { it.readBytes() }
             if (bytes == null || bytes.isEmpty()) {
                 log("Failed to read bytes from URI: $uri")
@@ -248,7 +349,6 @@ class HookEntry : IXposedHookLoadPackage {
                 log("Query display name error: ${e.message}")
             }
 
-            // 补充合适的扩展名
             if (!fileName.contains(".")) {
                 val mime = resolver.getType(uri)
                 val ext = when (mime) {
@@ -263,7 +363,13 @@ class HookEntry : IXposedHookLoadPackage {
 
             log("Uploading image: $fileName (${bytes.size} bytes)")
             val boundary = "----Boundary${UUID.randomUUID()}"
-            val conn = (URL(UPLOAD_URL).openConnection() as HttpURLConnection).apply {
+            val uploadEndpoint = if (authCode.isNotEmpty()) {
+                "$baseUrl/upload?authCode=$authCode"
+            } else {
+                "$baseUrl/upload"
+            }
+
+            val conn = (URL(uploadEndpoint).openConnection() as HttpURLConnection).apply {
                 requestMethod = "POST"
                 doOutput = true
                 doInput = true
@@ -301,7 +407,7 @@ class HookEntry : IXposedHookLoadPackage {
                 val src = JSONArray(respText).optJSONObject(0)?.optString("src").orEmpty()
                 if (src.isNotEmpty()) {
                     val dateTitle = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date())
-                    val markdown = "![$dateTitle]($BASE_URL$src)"
+                    val markdown = "![$dateTitle]($baseUrl$src)"
                     copyToClipboardAndToast(markdown, "已上传并复制 Markdown")
                     return
                 }

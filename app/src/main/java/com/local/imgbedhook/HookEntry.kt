@@ -9,6 +9,9 @@ import android.content.ClipboardManager
 import android.content.ContentResolver
 import android.content.ContentValues
 import android.content.Context
+import android.content.res.Configuration
+import android.graphics.Color
+import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
@@ -25,7 +28,6 @@ import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.callbacks.XC_LoadPackage
 import org.json.JSONArray
 import java.io.DataOutputStream
-import java.io.FilterOutputStream
 import java.io.OutputStream
 import java.lang.ref.WeakReference
 import java.net.HttpURLConnection
@@ -35,6 +37,7 @@ import java.util.Collections
 import java.util.Date
 import java.util.Locale
 import java.util.UUID
+import java.util.WeakHashMap
 import java.util.concurrent.Executors
 
 class HookEntry : IXposedHookLoadPackage {
@@ -48,6 +51,9 @@ class HookEntry : IXposedHookLoadPackage {
 
         private val executor = Executors.newSingleThreadExecutor()
         private val handledUris = Collections.synchronizedSet(HashSet<String>())
+        private val pendingStreams = Collections.synchronizedMap(WeakHashMap<OutputStream, Pair<ContentResolver, Uri>>())
+        private val hookedStreamClasses = Collections.synchronizedSet(HashSet<Class<*>>())
+
         private var currentActivityRef: WeakReference<Activity>? = null
         @Volatile
         private var appContext: Context? = null
@@ -130,7 +136,7 @@ class HookEntry : IXposedHookLoadPackage {
             }
         )
 
-        // 2. 拦截方案 A：监听 openOutputStream 关闭（覆盖 SAF 自定义文件夹及相册直接流写入）
+        // 2. 拦截方案 A：原生无侵入式流监听（绝不包装 FilterOutputStream，保留原始 FileOutputStream/fd.sync，防止破坏原版“是否删除原图”流程）
         XposedBridge.hookAllMethods(
             ContentResolver::class.java,
             "openOutputStream",
@@ -145,17 +151,26 @@ class HookEntry : IXposedHookLoadPackage {
                         uriStr.contains("document") ||
                         uriStr.contains("storage")
                     ) {
-                        log("openOutputStream intercepted for: $uriStr")
+                        log("openOutputStream intercepted for: $uriStr, streamClass=${rawOs.javaClass.name}")
                         val resolver = param.thisObject as ContentResolver
-                        param.result = object : FilterOutputStream(rawOs) {
-                            override fun close() {
-                                try {
-                                    super.close()
-                                } finally {
-                                    log("OutputStream closed for: $uriStr")
-                                    onImageSaveCompleted(resolver, uri)
+                        pendingStreams[rawOs] = Pair(resolver, uri)
+
+                        // 动态 Hook 该具体输出流子类的 close() 方法，不修改 param.result，保持原生底层性能与类型兼容
+                        val streamClass = rawOs.javaClass
+                        if (hookedStreamClasses.add(streamClass)) {
+                            log("Hooking close() on stream class: ${streamClass.name}")
+                            XposedBridge.hookAllMethods(
+                                streamClass,
+                                "close",
+                                object : XC_MethodHook() {
+                                    override fun afterHookedMethod(closeParam: MethodHookParam) {
+                                        val stream = closeParam.thisObject as? OutputStream ?: return
+                                        val pair = pendingStreams.remove(stream) ?: return
+                                        log("OutputStream.close finished for: ${pair.second}")
+                                        onImageSaveCompleted(pair.first, pair.second)
+                                    }
                                 }
-                            }
+                            )
                         }
                     }
                 }
@@ -190,9 +205,10 @@ class HookEntry : IXposedHookLoadPackage {
             return
         }
 
+        // 延迟 300ms，让 Image Toolbox 原生保存协程完成落盘与原生弹窗（如是否删除原图）启动
         Handler(Looper.getMainLooper()).postDelayed({
             showChoiceDialog(resolver, uri)
-        }, 100)
+        }, 300)
 
         executor.execute {
             try {
@@ -204,34 +220,73 @@ class HookEntry : IXposedHookLoadPackage {
 
     private fun showConfigDialog(activity: Activity, onSaved: (() -> Unit)? = null) {
         val (currentBaseUrl, currentAuthCode) = getConfig(activity)
+        val density = activity.resources.displayMetrics.density
+
+        // 自适应明暗主题计算高对比度配色
+        val isDarkTheme = (activity.resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES
+        val textColor = if (isDarkTheme) Color.parseColor("#EEEEEE") else Color.parseColor("#1A1A1A")
+        val labelColor = if (isDarkTheme) Color.parseColor("#BBBBBB") else Color.parseColor("#444444")
+        val hintColor = if (isDarkTheme) Color.parseColor("#777777") else Color.parseColor("#888888")
+        val inputBgColor = if (isDarkTheme) Color.parseColor("#282828") else Color.parseColor("#F2F4F7")
+        val inputBorderColor = if (isDarkTheme) Color.parseColor("#444444") else Color.parseColor("#D0D5DD")
 
         val container = LinearLayout(activity).apply {
             orientation = LinearLayout.VERTICAL
-            val dp16 = (16 * activity.resources.displayMetrics.density).toInt()
-            val dp8 = (8 * activity.resources.displayMetrics.density).toInt()
-            setPadding(dp16, dp8, dp16, dp8)
+            val padH = (20 * density).toInt()
+            val padV = (12 * density).toInt()
+            setPadding(padH, padV, padH, padV)
+        }
+
+        fun createBoxBg(): GradientDrawable {
+            return GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                cornerRadius = 14 * density
+                setColor(inputBgColor)
+                setStroke((1.5f * density).toInt(), inputBorderColor)
+            }
         }
 
         val tvUrl = TextView(activity).apply {
             text = "图床域名 / 基础 URL："
+            setTextColor(labelColor)
             textSize = 14f
+            val bPad = (6 * density).toInt()
+            setPadding(0, 0, 0, bPad)
         }
+
         val etUrl = EditText(activity).apply {
             hint = "例如: https://your-imgbed.pages.dev"
             setText(currentBaseUrl)
+            setTextColor(textColor)
+            setHintTextColor(hintColor)
+            textSize = 15f
             setSingleLine()
+            background = createBoxBg()
+            val pH = (12 * density).toInt()
+            val pV = (10 * density).toInt()
+            setPadding(pH, pV, pH, pV)
         }
 
         val tvAuth = TextView(activity).apply {
             text = "上传认证密码 AuthCode (无密码请留空)："
+            setTextColor(labelColor)
             textSize = 14f
-            val dp12 = (12 * activity.resources.displayMetrics.density).toInt()
-            setPadding(0, dp12, 0, 0)
+            val tPad = (14 * density).toInt()
+            val bPad = (6 * density).toInt()
+            setPadding(0, tPad, 0, bPad)
         }
+
         val etAuth = EditText(activity).apply {
             hint = "选填"
             setText(currentAuthCode)
+            setTextColor(textColor)
+            setHintTextColor(hintColor)
+            textSize = 15f
             setSingleLine()
+            background = createBoxBg()
+            val pH = (12 * density).toInt()
+            val pV = (10 * density).toInt()
+            setPadding(pH, pV, pH, pV)
         }
 
         container.addView(tvUrl)
@@ -239,7 +294,8 @@ class HookEntry : IXposedHookLoadPackage {
         container.addView(tvAuth)
         container.addView(etAuth)
 
-        AlertDialog.Builder(activity, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+        // 采用 activity 当前主题渲染弹窗，防止 ColorOS 深色对话框冲突
+        AlertDialog.Builder(activity)
             .setTitle("⚙️ 图床参数配置")
             .setView(container)
             .setPositiveButton("保存") { dialog, _ ->
@@ -281,13 +337,13 @@ class HookEntry : IXposedHookLoadPackage {
 
         val (baseUrl, authCode) = getConfig(activity)
         val message = if (baseUrl.isNotEmpty()) {
-            "当前图床: $baseUrl\n请选择后续操作："
+            "当前图床: $baseUrl\n\n请选择后续操作："
         } else {
             "当前尚未配置图床！\n请点击【⚙️ 配置】填写你的私有图床域名。"
         }
 
         log("Showing choice dialog on Activity: ${activity.javaClass.simpleName}")
-        AlertDialog.Builder(activity, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+        AlertDialog.Builder(activity)
             .setTitle("图片已保存")
             .setMessage(message)
             .setNegativeButton("正常保存") { dialog, _ ->

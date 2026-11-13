@@ -2,17 +2,19 @@ package com.local.imgbedhook
 
 import android.app.Activity
 import android.app.AlertDialog
+import android.app.Application
 import android.app.AndroidAppHelper
-import android.app.Instrumentation
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.ContentResolver
 import android.content.ContentValues
 import android.content.Context
 import android.net.Uri
+import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.provider.MediaStore
+import android.util.Log
 import android.widget.Toast
 import de.robv.android.xposed.IXposedHookLoadPackage
 import de.robv.android.xposed.XC_MethodHook
@@ -20,6 +22,8 @@ import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.callbacks.XC_LoadPackage
 import org.json.JSONArray
 import java.io.DataOutputStream
+import java.io.FilterOutputStream
+import java.io.OutputStream
 import java.lang.ref.WeakReference
 import java.net.HttpURLConnection
 import java.net.URL
@@ -33,6 +37,7 @@ import java.util.concurrent.Executors
 class HookEntry : IXposedHookLoadPackage {
 
     companion object {
+        private const val TAG = "ImageToolboxImgBed"
         private const val TARGET_PKG = "ru.tech.imageresizershrinker"
         private const val BASE_URL = "https://imgbed1026.pages.dev"
         // 若后台开启了上传认证密码，改为 "$BASE_URL/upload?authCode=你的密码"
@@ -43,18 +48,61 @@ class HookEntry : IXposedHookLoadPackage {
         private var currentActivityRef: WeakReference<Activity>? = null
         @Volatile
         private var appContext: Context? = null
+
+        fun log(msg: String) {
+            XposedBridge.log("[$TAG] $msg")
+            Log.d(TAG, msg)
+        }
     }
 
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != TARGET_PKG) return
 
-        // 1. 追踪 Image Toolbox 当前处于前台的 Activity，供弹窗使用
+        log("Hook initialized in target process: ${lpparam.processName}")
+
+        // 1. 通过 Application 生命周期官方接口，精准追踪前台 Activity
         XposedBridge.hookAllMethods(
-            Instrumentation::class.java,
-            "callActivityOnResume",
+            Application::class.java,
+            "onCreate",
             object : XC_MethodHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
-                    val activity = param.args.getOrNull(0) as? Activity ?: return
+                    val app = param.thisObject as? Application ?: return
+                    appContext = app
+                    app.registerActivityLifecycleCallbacks(object : Application.ActivityLifecycleCallbacks {
+                        override fun onActivityResumed(activity: Activity) {
+                            currentActivityRef = WeakReference(activity)
+                            log("Activity resumed: ${activity.javaClass.simpleName}")
+                        }
+
+                        override fun onActivityPaused(activity: Activity) {}
+                        override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) {
+                            currentActivityRef = WeakReference(activity)
+                        }
+
+                        override fun onActivityStarted(activity: Activity) {
+                            currentActivityRef = WeakReference(activity)
+                        }
+
+                        override fun onActivityStopped(activity: Activity) {}
+                        override fun onActivitySaveInstanceState(activity: Activity, outState: Bundle) {}
+                        override fun onActivityDestroyed(activity: Activity) {
+                            if (currentActivityRef?.get() === activity) {
+                                currentActivityRef = null
+                            }
+                        }
+                    })
+                    log("Registered ActivityLifecycleCallbacks successfully")
+                }
+            }
+        )
+
+        // 兜底直接 Hook Activity.onResume
+        XposedBridge.hookAllMethods(
+            Activity::class.java,
+            "onResume",
+            object : XC_MethodHook() {
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    val activity = param.thisObject as? Activity ?: return
                     if (activity.packageName == TARGET_PKG) {
                         currentActivityRef = WeakReference(activity)
                         appContext = activity.applicationContext
@@ -63,20 +111,40 @@ class HookEntry : IXposedHookLoadPackage {
             }
         )
 
+        // 2. 拦截方案 A：监听 openOutputStream 关闭（覆盖 SAF 自定义文件夹及相册直接流写入）
         XposedBridge.hookAllMethods(
-            Instrumentation::class.java,
-            "callActivityOnPause",
+            ContentResolver::class.java,
+            "openOutputStream",
             object : XC_MethodHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
-                    val activity = param.args.getOrNull(0) as? Activity ?: return
-                    if (currentActivityRef?.get() === activity) {
-                        currentActivityRef = null
+                    val uri = param.args.getOrNull(0) as? Uri ?: return
+                    val rawOs = param.result as? OutputStream ?: return
+                    val uriStr = uri.toString()
+
+                    // 仅关注媒体/文档保存流，排除无意义的临时缓存流
+                    if (uriStr.startsWith("content://media/") ||
+                        uriStr.contains("document") ||
+                        uriStr.contains("storage")
+                    ) {
+                        log("openOutputStream intercepted for: $uriStr")
+                        val resolver = param.thisObject as ContentResolver
+                        // 包装 OutputStream，在 close 完毕后触发保存完成弹窗
+                        param.result = object : FilterOutputStream(rawOs) {
+                            override fun close() {
+                                try {
+                                    super.close()
+                                } finally {
+                                    log("OutputStream closed for: $uriStr")
+                                    onImageSaveCompleted(resolver, uri)
+                                }
+                            }
+                        }
                     }
                 }
             }
         )
 
-        // 2. 监听媒体库文件写入完成（IS_PENDING -> 0）
+        // 3. 拦截方案 B：监听 ContentResolver.update（针对 Scoped Storage IS_PENDING 模式）
         XposedBridge.hookAllMethods(
             ContentResolver::class.java,
             "update",
@@ -84,64 +152,103 @@ class HookEntry : IXposedHookLoadPackage {
                 override fun afterHookedMethod(param: MethodHookParam) {
                     val uri = param.args.getOrNull(0) as? Uri ?: return
                     val values = param.args.getOrNull(1) as? ContentValues ?: return
-
-                    if (!uri.toString().startsWith("content://media/")) return
                     val isPending = values.getAsInteger(MediaStore.MediaColumns.IS_PENDING)
-                    if (isPending != 0) return
 
-                    if (!handledUris.add(uri.toString())) return
-
-                    val resolver = param.thisObject as ContentResolver
-                    showChoiceDialog(resolver, uri)
+                    log("ContentResolver.update: uri=$uri, isPending=$isPending")
+                    if (isPending == 0) {
+                        log("IS_PENDING changed to 0 for: $uri")
+                        val resolver = param.thisObject as ContentResolver
+                        onImageSaveCompleted(resolver, uri)
+                    }
                 }
             }
         )
     }
 
-    private fun showChoiceDialog(resolver: ContentResolver, uri: Uri) {
-        Handler(Looper.getMainLooper()).post {
-            val activity = currentActivityRef?.get()
-            // 若当前无可用前台 Activity，默认保持仅本地保存，不执行上传
-            if (activity == null || activity.isFinishing || activity.isDestroyed) return@post
-
-            AlertDialog.Builder(activity, android.R.style.Theme_DeviceDefault_Dialog_Alert)
-                .setTitle("图片已保存")
-                .setMessage("请选择后续操作：")
-                .setNegativeButton("正常保存") { dialog, _ ->
-                    dialog.dismiss()
-                }
-                .setPositiveButton("保存并上传图床") { dialog, _ ->
-                    dialog.dismiss()
-                    Toast.makeText(activity, "正在上传图床...", Toast.LENGTH_SHORT).show()
-                    executor.execute {
-                        uploadAndCopy(resolver, uri)
-                    }
-                }
-                .setCancelable(true)
-                .show()
+    private fun onImageSaveCompleted(resolver: ContentResolver, uri: Uri) {
+        val uriStr = uri.toString()
+        // 去重防止同一张图在 update 和 close 中重复触发
+        if (!handledUris.add(uriStr)) {
+            log("URI already handled, skip: $uriStr")
+            return
         }
+
+        // 短暂延迟 100ms 确保媒体库索引与文件系统完全落盘
+        Handler(Looper.getMainLooper()).postDelayed({
+            showChoiceDialog(resolver, uri)
+        }, 100)
+
+        // 5秒后允许同一 URI 再次触发（方便覆盖保存场景）
+        executor.execute {
+            try {
+                Thread.sleep(5000)
+                handledUris.remove(uriStr)
+            } catch (_: Exception) {}
+        }
+    }
+
+    private fun showChoiceDialog(resolver: ContentResolver, uri: Uri) {
+        val activity = currentActivityRef?.get()
+        if (activity == null || activity.isFinishing || activity.isDestroyed) {
+            log("Cannot show dialog: current Activity is null or finishing! Falling back to Toast notification.")
+            val ctx = appContext ?: AndroidAppHelper.currentApplication()
+            ctx?.let {
+                Handler(Looper.getMainLooper()).post {
+                    Toast.makeText(it, "图片已保存（未捕获前台窗口，已保留本地）", Toast.LENGTH_SHORT).show()
+                }
+            }
+            return
+        }
+
+        log("Showing choice dialog on Activity: ${activity.javaClass.simpleName}")
+        AlertDialog.Builder(activity, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+            .setTitle("图片已保存")
+            .setMessage("请选择后续操作：")
+            .setNegativeButton("正常保存") { dialog, _ ->
+                log("User selected: 正常保存")
+                dialog.dismiss()
+            }
+            .setPositiveButton("保存并上传图床") { dialog, _ ->
+                log("User selected: 保存并上传图床")
+                dialog.dismiss()
+                Toast.makeText(activity, "正在上传图床...", Toast.LENGTH_SHORT).show()
+                executor.execute {
+                    uploadAndCopy(resolver, uri)
+                }
+            }
+            .setCancelable(true)
+            .show()
     }
 
     private fun uploadAndCopy(resolver: ContentResolver, uri: Uri) {
         try {
-            val bytes = resolver.openInputStream(uri)?.use { it.readBytes() } ?: return
-            if (bytes.isEmpty()) return
-
-            var fileName = "image_${System.currentTimeMillis()}.jpg"
-            resolver.query(
-                uri,
-                arrayOf(MediaStore.MediaColumns.DISPLAY_NAME),
-                null,
-                null,
-                null
-            )?.use { cursor ->
-                if (cursor.moveToFirst()) {
-                    val name = cursor.getString(0)
-                    if (!name.isNullOrBlank()) fileName = name
-                }
+            log("Starting upload for URI: $uri")
+            val bytes = resolver.openInputStream(uri)?.use { it.readBytes() }
+            if (bytes == null || bytes.isEmpty()) {
+                log("Failed to read bytes from URI: $uri")
+                copyToClipboardAndToast(null, "图床上传失败: 读取图片文件为空")
+                return
             }
 
-            // 确保文件名有合适扩展名，以便图床识别 MIME 类型
+            var fileName = "image_${System.currentTimeMillis()}.jpg"
+            try {
+                resolver.query(
+                    uri,
+                    arrayOf(MediaStore.MediaColumns.DISPLAY_NAME),
+                    null,
+                    null,
+                    null
+                )?.use { cursor ->
+                    if (cursor.moveToFirst()) {
+                        val name = cursor.getString(0)
+                        if (!name.isNullOrBlank()) fileName = name
+                    }
+                }
+            } catch (e: Exception) {
+                log("Query display name error: ${e.message}")
+            }
+
+            // 补充合适的扩展名
             if (!fileName.contains(".")) {
                 val mime = resolver.getType(uri)
                 val ext = when (mime) {
@@ -154,6 +261,7 @@ class HookEntry : IXposedHookLoadPackage {
                 fileName += ext
             }
 
+            log("Uploading image: $fileName (${bytes.size} bytes)")
             val boundary = "----Boundary${UUID.randomUUID()}"
             val conn = (URL(UPLOAD_URL).openConnection() as HttpURLConnection).apply {
                 requestMethod = "POST"
@@ -187,6 +295,8 @@ class HookEntry : IXposedHookLoadPackage {
             val respText = (if (code in 200..299) conn.inputStream else conn.errorStream)
                 ?.bufferedReader()?.use { it.readText() } ?: ""
 
+            log("Upload response code: $code, body: $respText")
+
             if (code in 200..299) {
                 val src = JSONArray(respText).optJSONObject(0)?.optString("src").orEmpty()
                 if (src.isNotEmpty()) {
@@ -198,6 +308,7 @@ class HookEntry : IXposedHookLoadPackage {
             }
             copyToClipboardAndToast(null, "图床上传失败 ($code): $respText")
         } catch (e: Exception) {
+            log("Upload exception: ${e.message}")
             XposedBridge.log(e)
             copyToClipboardAndToast(null, "图床上传异常: ${e.message}")
         }

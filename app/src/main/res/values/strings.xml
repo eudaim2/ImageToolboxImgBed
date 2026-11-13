@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">ImageToolbox ImgBed Hook</string>
+    <string name="xposed_description">Image Toolbox 保存图片后选择直接保存或上传图床并复制 Markdown</string>
+</resources>

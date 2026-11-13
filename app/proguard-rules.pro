@@ -1,0 +1,3 @@
+-keep class com.local.imgbedhook.HookEntry { *; }
+-keep class de.robv.android.xposed.** { *; }
+-dontwarn de.robv.android.xposed.**
